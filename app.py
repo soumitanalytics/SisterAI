@@ -22,19 +22,38 @@ from gtts import gTTS
 import requests
 import streamlit as st
 
-# 1. Load Environment Variables (Supports both local .env and Streamlit Cloud st.secrets)
+# 1. Load Environment Variables & Cloud Secrets Safely
 load_dotenv()
-API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
 
-SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
-MAIL_RELAY_URL = os.getenv("MAIL_RELAY_URL", "")
+def _get_secret_or_env(key: str, default: str = "") -> str:
+    env_val = os.getenv(key)
+    if env_val:
+        return env_val.strip()
+    try:
+        if key in st.secrets and st.secrets[key]:
+            return str(st.secrets[key]).strip()
+    except Exception:
+        pass
+    return default
 
-# Initialize Gemini Client
-client = genai.Client(api_key=API_KEY)
+API_KEY = _get_secret_or_env("GEMINI_API_KEY", "")
+SMTP_HOST = _get_secret_or_env("SMTP_HOST", "")
+SMTP_PORT = int(_get_secret_or_env("SMTP_PORT", "587") or "587")
+SMTP_USER = _get_secret_or_env("SMTP_USER", "")
+SMTP_PASS = _get_secret_or_env("SMTP_PASS", "")
+SMTP_FROM = _get_secret_or_env("SMTP_FROM", SMTP_USER)
+MAIL_RELAY_URL = _get_secret_or_env("MAIL_RELAY_URL", "")
+
+_genai_client: genai.Client | None = None
+
+def get_genai_client() -> genai.Client:
+    global _genai_client
+    key = API_KEY or _get_secret_or_env("GEMINI_API_KEY", "")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY is missing. Add it to .env locally or to Streamlit Cloud Secrets.")
+    if _genai_client is None:
+        _genai_client = genai.Client(api_key=key)
+    return _genai_client
 
 # Paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -117,7 +136,7 @@ def _match_department_name(raw_dept: str) -> str | None:
 
 # 4. Pure-Python Valid PDF Bill Generator (ASCII-safe)
 def _pdf_escape(text: str) -> str:
-    ascii_safe = text.encode("ascii", errors="replace").decode("ascii")
+    ascii_safe = str(text or "").encode("ascii", errors="replace").decode("ascii")
     return ascii_safe.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 def create_pdf_bill_file(bill_record: dict) -> tuple[str, bytes]:
@@ -199,15 +218,19 @@ def create_pdf_bill_file(bill_record: dict) -> tuple[str, bytes]:
     pdf_bytes = bytes(pdf_out)
     safe_uhid = re.sub(r"[^A-Za-z0-9_-]", "_", bill_record["unique_id"])
     file_path = os.path.join(BILLS_DIR, f"Bill_{safe_uhid}_Appt{bill_record['appointment_id']}.pdf")
-    with open(file_path, "wb") as f:
-        f.write(pdf_bytes)
+    try:
+        with open(file_path, "wb") as f:
+            f.write(pdf_bytes)
+    except Exception:
+        pass
 
     return file_path, pdf_bytes
 
 # 5. SQLite Database (Staff RBAC, Appointments, Referrals, Ops Incidents, Chat Sessions)
 def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 15000")
     return conn
 
 def init_database() -> None:
@@ -748,13 +771,13 @@ def register_and_schedule_patient(
         return access_err
 
     missing_fields = []
-    if not patient_name.strip():
+    if not (patient_name or "").strip():
         missing_fields.append("patient_name")
-    if not appt_date.strip():
+    if not (appt_date or "").strip():
         missing_fields.append("appt_date")
-    if not appt_time.strip():
+    if not (appt_time or "").strip():
         missing_fields.append("appt_time")
-    if not scan_procedure.strip():
+    if not (scan_procedure or "").strip():
         missing_fields.append("scan_procedure")
 
     if missing_fields:
@@ -765,25 +788,28 @@ def register_and_schedule_patient(
         )
 
     recommended_missing = []
-    if not phone.strip():
+    if not (phone or "").strip():
         recommended_missing.append("phone")
-    if not email.strip():
+    if not (email or "").strip():
         recommended_missing.append("email")
-    if not address.strip():
+    if not (address or "").strip():
         recommended_missing.append("address")
-    if not referring_doctor.strip():
+    if not (referring_doctor or "").strip():
         recommended_missing.append("referring_doctor")
-    if not prescription.strip():
+    if not (prescription or "").strip():
         recommended_missing.append("prescription")
 
     uhid_generated = False
-    clean_uhid = unique_id.strip()
+    clean_uhid = (unique_id or "").strip()
     if not clean_uhid:
         clean_uhid = generate_uhid(appt_date.strip())
         uhid_generated = True
 
     clean_type = "Inpatient" if "in" in (patient_type or "").lower() else "Outpatient"
-    clean_age = max(0, int(age)) if age is not None else 30
+    try:
+        clean_age = max(0, int(age)) if age is not None else 30
+    except Exception:
+        clean_age = 30
     amount_inr = estimate_procedure_amount(scan_procedure)
     chosen_mode = _normalize_payment_mode(payment_mode)
     staff_user = get_active_user()
@@ -810,6 +836,7 @@ def register_and_schedule_patient(
 
     conn = get_db_connection()
     try:
+        clean_res = (provider_or_resource or "").strip() or "Assigned Modality / Specialist"
         conflict = conn.execute(
             """
             SELECT id, patient_name FROM appointments
@@ -819,11 +846,11 @@ def register_and_schedule_patient(
               AND LOWER(provider_or_resource) = LOWER(?)
               AND status != 'Cancelled'
             """,
-            (target_dept, appt_date.strip(), appt_time.strip(), provider_or_resource.strip()),
+            (target_dept, appt_date.strip(), appt_time.strip(), clean_res),
         ).fetchone()
         if conflict:
             return (
-                f"CONFLICT in {target_dept}: {provider_or_resource} is already booked at {appt_time} on {appt_date} "
+                f"CONFLICT in {target_dept}: {clean_res} is already booked at {appt_time} on {appt_date} "
                 f"for {conflict['patient_name']} (Booking #{conflict['id']})."
             )
 
@@ -840,19 +867,19 @@ def register_and_schedule_patient(
                 clean_uhid,
                 patient_name.strip(),
                 clean_age,
-                prescription.strip() or "Departmental Intake / Pending Rx",
-                referring_doctor.strip() or "Direct / Dept Referral",
+                (prescription or "").strip() or "Departmental Intake / Pending Rx",
+                (referring_doctor or "").strip() or "Direct / Dept Referral",
                 clean_type,
-                phone.strip() or "N/A",
-                address.strip() or "Not Provided",
-                email.strip() or "Not Provided",
+                (phone or "").strip() or "N/A",
+                (address or "").strip() or "Not Provided",
+                (email or "").strip() or "Not Provided",
                 target_dept,
-                provider_or_resource.strip() or "Assigned Modality",
+                clean_res,
                 appt_date.strip(),
                 appt_time.strip(),
                 scan_procedure.strip(),
-                reason.strip() or scan_procedure.strip(),
-                status.strip() or "Scheduled",
+                (reason or "").strip() or scan_procedure.strip(),
+                (status or "").strip() or "Scheduled",
                 chosen_mode,
                 payment_status,
                 payment_link,
@@ -871,16 +898,16 @@ def register_and_schedule_patient(
             "patient_name": patient_name.strip(),
             "age": clean_age,
             "patient_type": clean_type,
-            "phone": phone.strip() or "N/A",
-            "email": email.strip() or "Not Provided",
-            "address": address.strip() or "Not Provided",
-            "referring_doctor": referring_doctor.strip() or "Direct / Dept Referral",
-            "prescription": prescription.strip() or "Departmental Intake / Pending Rx",
+            "phone": (phone or "").strip() or "N/A",
+            "email": (email or "").strip() or "Not Provided",
+            "address": (address or "").strip() or "Not Provided",
+            "referring_doctor": (referring_doctor or "").strip() or "Direct / Dept Referral",
+            "prescription": (prescription or "").strip() or "Departmental Intake / Pending Rx",
             "scan_procedure": scan_procedure.strip(),
-            "reason": reason.strip() or scan_procedure.strip(),
+            "reason": (reason or "").strip() or scan_procedure.strip(),
             "appt_date": appt_date.strip(),
             "appt_time": appt_time.strip(),
-            "status": status.strip() or "Scheduled",
+            "status": (status or "").strip() or "Scheduled",
             "amount_inr": amount_inr,
             "payment_mode": chosen_mode,
             "payment_status": payment_status,
@@ -910,10 +937,10 @@ def register_and_schedule_patient(
             f"SCHEDULED_AND_BILLED [{target_dept}]:\n"
             f"- Appointment ID: #{appt_id} | Unique ID: {uhid_msg}\n"
             f"- Patient: {patient_name.strip()} | Age: {clean_age} | Type: {clean_type}\n"
-            f"- Procedure: {scan_procedure.strip()} ({provider_or_resource.strip()})\n"
-            f"- Date & Time: {appt_date.strip()} at {appt_time.strip()} | Status: {status.strip() or 'Scheduled'}\n"
-            f"- Referring Dr: {referring_doctor.strip() or 'Direct / Dept Referral'} | Rx: {prescription.strip() or 'Departmental Intake / Pending Rx'}\n"
-            f"- Contact: {phone.strip() or 'N/A'} | Email: {email.strip() or 'Not Provided'} | Address: {address.strip() or 'Not Provided'}\n"
+            f"- Procedure: {scan_procedure.strip()} ({clean_res})\n"
+            f"- Date & Time: {appt_date.strip()} at {appt_time.strip()} | Status: {(status or '').strip() or 'Scheduled'}\n"
+            f"- Referring Dr: {(referring_doctor or '').strip() or 'Direct / Dept Referral'} | Rx: {(prescription or '').strip() or 'Departmental Intake / Pending Rx'}\n"
+            f"- Contact: {(phone or '').strip() or 'N/A'} | Email: {(email or '').strip() or 'Not Provided'} | Address: {(address or '').strip() or 'Not Provided'}\n"
             f"- Billing: INR {amount_inr} | Mode: {chosen_mode} | Payment Status: {payment_status} ({payment_note})\n"
             f"- {branch_line}\n"
             f"- PDF Bill Saved: {os.path.basename(bill_path)}\n"
@@ -942,11 +969,11 @@ def create_department_referral(
     if matched_target == from_dept:
         return f"SAME_DEPARTMENT: Patient is already in {from_dept}. Book directly instead of creating an external referral."
 
-    if not patient_name.strip() or not requested_procedure.strip():
+    if not (patient_name or "").strip() or not (requested_procedure or "").strip():
         return "INCOMPLETE_REFERRAL: Both patient_name and requested_procedure are required."
 
-    clean_uhid = unique_id.strip() or generate_uhid("2026-11-19")
-    clean_prio = priority.strip().title() if priority.strip() else "Routine"
+    clean_uhid = (unique_id or "").strip() or generate_uhid("2026-11-19")
+    clean_prio = (priority or "").strip().title() if (priority or "").strip() else "Routine"
     if clean_prio not in ("Routine", "Urgent", "Stat"):
         clean_prio = "Routine"
 
@@ -965,8 +992,8 @@ def create_department_referral(
                 from_dept,
                 matched_target,
                 requested_procedure.strip(),
-                clinical_notes.strip() or "Referred for departmental evaluation",
-                clean_prio.upper() if clean_prio == "Stat" else clean_prio,
+                (clinical_notes or "").strip() or "Referred for departmental evaluation",
+                "STAT" if clean_prio == "Stat" else clean_prio,
                 user["full_name"],
             ),
         )
@@ -976,7 +1003,7 @@ def create_department_referral(
             f"- Handoff: {from_dept} -> {matched_target}\n"
             f"- Patient: {patient_name.strip()} | UHID: {clean_uhid}\n"
             f"- Requested Procedure/Consult: {requested_procedure.strip()} | Priority: {clean_prio}\n"
-            f"- Clinical Notes: {clinical_notes.strip() or 'Referred for departmental evaluation'}\n"
+            f"- Clinical Notes: {(clinical_notes or '').strip() or 'Referred for departmental evaluation'}\n"
             f"- Referred By: {user['full_name']} | Status: Pending receiving desk intake"
         )
     except Exception as e:
@@ -1113,8 +1140,8 @@ def check_availability(
             FROM appointments
             WHERE appt_date = ? AND department = ? AND status != 'Cancelled'
         """
-        params: list = [appt_date.strip(), target_dept]
-        if provider_or_resource.strip():
+        params: list = [(appt_date or "").strip(), target_dept]
+        if (provider_or_resource or "").strip():
             query += " AND LOWER(provider_or_resource) LIKE ?"
             params.append(f"%{provider_or_resource.strip().lower()}%")
         query += " ORDER BY appt_time ASC"
@@ -1153,10 +1180,10 @@ def reschedule_or_update_appointment(
                 f"Your workstation is restricted to '{active_dept}'."
             )
 
-        target_date = new_date.strip() if new_date.strip() else existing["appt_date"]
-        target_time = new_time.strip() if new_time.strip() else existing["appt_time"]
-        target_status = status.strip() if status.strip() else existing["status"]
-        target_pay = payment_status.strip().upper() if payment_status.strip() else existing["payment_status"]
+        target_date = (new_date or "").strip() if (new_date or "").strip() else existing["appt_date"]
+        target_time = (new_time or "").strip() if (new_time or "").strip() else existing["appt_time"]
+        target_status = (status or "").strip() if (status or "").strip() else existing["status"]
+        target_pay = (payment_status or "").strip().upper() if (payment_status or "").strip() else existing["payment_status"]
 
         if target_status != "Cancelled":
             conflict = conn.execute(
@@ -1240,7 +1267,7 @@ def log_ops_or_rcm_incident(
     """Logs a department downtime, bottleneck, or claim denial/RCM issue in SQLite behind the scenes."""
     active_dept = get_active_department()
     user = get_active_user()
-    scoped_target = f"{active_dept} - {department_or_modality.strip()}" if department_or_modality.strip() else active_dept
+    scoped_target = f"{active_dept} - {(department_or_modality or '').strip()}" if (department_or_modality or "").strip() else active_dept
     conn = get_db_connection()
     try:
         cur = conn.execute(
@@ -1250,11 +1277,11 @@ def log_ops_or_rcm_incident(
             ) VALUES (?, ?, ?, ?, ?, 'Open', ?)
             """,
             (
-                category.strip() or "Operations",
+                (category or "").strip() or "Operations",
                 scoped_target,
-                summary.strip(),
-                severity.strip() or "Medium",
-                estimated_impact.strip() or "Unspecified",
+                (summary or "").strip(),
+                (severity or "").strip() or "Medium",
+                (estimated_impact or "").strip() or "Unspecified",
                 user["full_name"],
             ),
         )
@@ -1271,7 +1298,7 @@ def get_imaging_protocol_checklist(modality: str, contrast_or_implant: str = "")
     extra = (contrast_or_implant or "").strip()
     base = [
         f"Department Context: {get_active_department()}",
-        f"Procedure/Modality: {modality.strip() or 'Clinical / Diagnostic Protocol'}",
+        f"Procedure/Modality: {(modality or '').strip() or 'Clinical / Diagnostic Protocol'}",
         f"Screening Focus: {extra or 'Standard protocol & safety check'}",
     ]
     if "mri" in mod:
@@ -1302,10 +1329,13 @@ def get_imaging_protocol_checklist(modality: str, contrast_or_implant: str = "")
 # 11. Pharmaceutical Knowledge Tool (OpenFDA Live API - 100% Free)
 def lookup_pharmaceutical_data(drug_name: str) -> str:
     """Queries live OpenFDA drug label data for indications, contraindications, and warnings."""
+    clean_drug = (drug_name or "").strip()
+    if not clean_drug:
+        return "Please provide a medication or contrast agent name."
     try:
         url = (
             "https://api.fda.gov/drug/label.json?"
-            f'search=openfda.brand_name:"{drug_name}"+openfda.generic_name:"{drug_name}"&limit=1'
+            f'search=openfda.brand_name:"{quote_plus(clean_drug)}"+openfda.generic_name:"{quote_plus(clean_drug)}"&limit=1'
         )
         response = requests.get(url, timeout=6)
         if response.status_code == 200:
@@ -1313,7 +1343,7 @@ def lookup_pharmaceutical_data(drug_name: str) -> str:
             if data.get("results"):
                 res = data["results"][0]
                 openfda = res.get("openfda", {})
-                brand = ", ".join(openfda.get("brand_name", [drug_name]))
+                brand = ", ".join(openfda.get("brand_name", [clean_drug]))
                 generic = ", ".join(openfda.get("generic_name", ["N/A"]))
                 indications = " ".join(res.get("indications_and_usage", ["Not listed."]))[:650]
                 warnings = " ".join(res.get("warnings", res.get("boxed_warning", ["No specific warnings listed."])))[:650]
@@ -1324,9 +1354,9 @@ def lookup_pharmaceutical_data(drug_name: str) -> str:
                     f"- Contraindications: {contraindications}\n"
                     f"- Warnings: {warnings}"
                 )
-        return f"No exact FDA record for '{drug_name}'."
+        return f"No exact FDA record found for '{clean_drug}'."
     except Exception as e:
-        return f"OpenFDA error: {str(e)}"
+        return f"OpenFDA lookup unavailable ({str(e)}). Provide general pharmacology guidance."
 
 # 12. Focused Healthcare News, Medical Journals & Research Papers Tool (Parallelized)
 def _fetch_pubmed_papers(clean_topic: str) -> str | None:
@@ -1362,7 +1392,7 @@ def _fetch_pubmed_papers(clean_topic: str) -> str | None:
 
 def _fetch_healthcare_news(clean_topic: str, scope: str) -> str | None:
     try:
-        sc = scope.lower()
+        sc = (scope or "both").lower()
         if sc == "national":
             site_filter = (
                 "(site:mohfw.gov.in OR site:icmr.gov.in OR site:health.economictimes.indiatimes.com "
@@ -1403,7 +1433,7 @@ def _fetch_healthcare_news(clean_topic: str, scope: str) -> str | None:
 
 def search_healthcare_literature_and_news(topic: str, scope: str = "both") -> str:
     """Searches healthcare news, medical journals, and papers across national (India) and international health sources."""
-    clean_topic = topic.strip()
+    clean_topic = (topic or "").strip()
     if not clean_topic:
         return "Provide a healthcare or medical research topic."
 
@@ -1411,24 +1441,30 @@ def search_healthcare_literature_and_news(topic: str, scope: str = "both") -> st
     with ThreadPoolExecutor(max_workers=2) as pool:
         fut_papers = (
             pool.submit(_fetch_pubmed_papers, clean_topic)
-            if scope.lower() in ("both", "international", "journals", "papers")
+            if (scope or "both").lower() in ("both", "international", "journals", "papers")
             else None
         )
-        fut_news = pool.submit(_fetch_healthcare_news, clean_topic, scope)
+        fut_news = pool.submit(_fetch_healthcare_news, clean_topic, scope or "both")
 
         if fut_papers:
-            p_res = fut_papers.result()
-            if p_res:
-                chunks.append(p_res)
-        n_res = fut_news.result()
-        if n_res:
-            chunks.append(n_res)
+            try:
+                p_res = fut_papers.result(timeout=8)
+                if p_res:
+                    chunks.append(p_res)
+            except Exception:
+                pass
+        try:
+            n_res = fut_news.result(timeout=8)
+            if n_res:
+                chunks.append(n_res)
+        except Exception:
+            pass
 
     return "\n\n".join(chunks) if chunks else f"No recent medical journal/news items found for '{clean_topic}'."
 
 # 13. Full-Length Text-to-Speech Helper
 def _clean_for_speech(text: str) -> str:
-    no_urls = re.sub(r"https?://\S+", "", text)
+    no_urls = re.sub(r"https?://\S+", "", text or "")
     no_md = re.sub(r"[*_#`~>\[\]\(\)]", " ", no_urls)
     no_emojis = re.sub(r"[^\w\s.,!?;:'\"-]", " ", no_md)
     return re.sub(r"\s+", " ", no_emojis).strip()
@@ -1549,7 +1585,7 @@ def build_multi_turn_contents(history_messages: list[dict], new_contents: list) 
     contents: list = []
     for m in history_messages[-6:]:
         role = "user" if m["role"] == "user" else "model"
-        txt = m["content"]
+        txt = m.get("content") or ""
         if role == "model" and len(txt) > 900:
             txt = txt[:900] + "..."
         contents.append(types.Content(role=role, parts=[types.Part.from_text(text=txt)]))
@@ -1563,17 +1599,17 @@ def build_multi_turn_contents(history_messages: list[dict], new_contents: list) 
 
 MODEL_FALLBACK_CHAIN = [
     "gemini-3.5-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash",
 ]
 
 def generate_with_retry(contents: list, instruction: str, temperature: float):
-    """Tries primary Gemini model and fails over automatically on 503/429 demand spikes."""
+    """Tries primary Gemini model and fails over automatically on 503/429/404 errors."""
+    active_client = get_genai_client()
     last_err = None
     for model_name in MODEL_FALLBACK_CHAIN:
         for attempt in range(2):
             try:
-                return client.models.generate_content(
+                return active_client.models.generate_content(
                     model=model_name,
                     contents=contents,
                     config=types.GenerateContentConfig(
@@ -1585,7 +1621,7 @@ def generate_with_retry(contents: list, instruction: str, temperature: float):
             except Exception as e:
                 last_err = e
                 err_str = str(e)
-                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "404" in err_str:
+                if any(code in err_str for code in ("503", "UNAVAILABLE", "429", "404", "NOT_FOUND")):
                     time.sleep(0.8)
                     continue
                 raise
@@ -1618,7 +1654,7 @@ def run_sister_turn(
                     instruction=active_instruction,
                     temperature=0.25 if live_voice_mode else 0.3,
                 )
-                reply_text = response.text or "No response returned."
+                reply_text = (getattr(response, "text", None) or "").strip() or "Completed request."
 
                 should_speak = (enable_voice_out or live_voice_mode) and not st.session_state.mute_current_audio
                 voice_stream = None
@@ -1726,7 +1762,7 @@ if st.session_state["auth_user"] is None:
                 }
                 for r in staff_rows
             ],
-            width="stretch",
+            use_container_width=True,
             hide_index=True,
         )
     st.stop()
@@ -1806,7 +1842,7 @@ with st.sidebar:
     else:
         st.info(f"🔒 Department: **{active_dept}**")
 
-    if st.button("➕ Create New Chat", width="stretch", type="primary"):
+    if st.button("➕ Create New Chat", use_container_width=True, type="primary"):
         new_id = create_chat_session(current_user["username"], active_dept, "New Healthcare Chat")
         st.session_state.active_session_id = new_id
         st.session_state.messages = []
@@ -1826,7 +1862,7 @@ with st.sidebar:
         with col_title:
             pin_prefix = "📌 " if is_pinned else ""
             active_prefix = "▸ " if is_current else ""
-            if st.button(f"{active_prefix}{pin_prefix}{s['title']}", key=f"open_{sid}", width="stretch"):
+            if st.button(f"{active_prefix}{pin_prefix}{s['title']}", key=f"open_{sid}", use_container_width=True):
                 st.session_state.active_session_id = sid
                 st.session_state.messages = load_session_messages(sid)
                 st.session_state.live_turn_counter += 1
@@ -1834,18 +1870,18 @@ with st.sidebar:
                 st.rerun()
 
         with col_menu:
-            with st.popover("⋮", width="stretch"):
+            with st.popover("⋮", use_container_width=True):
                 pin_label = "Unpin from Top" if is_pinned else "Pin to Top"
-                if st.button(pin_label, key=f"menu_pin_{sid}", width="stretch"):
+                if st.button(pin_label, key=f"menu_pin_{sid}", use_container_width=True):
                     toggle_pin_chat_session(sid)
                     st.rerun()
 
-                if st.button("Share Link", key=f"menu_share_{sid}", width="stretch"):
+                if st.button("Share Link", key=f"menu_share_{sid}", use_container_width=True):
                     token = build_share_token(sid)
                     st.session_state.share_link_for_session = (sid, s["title"], token)
 
                 if len(sessions) > 1:
-                    if st.button("Delete", key=f"menu_del_{sid}", width="stretch"):
+                    if st.button("Delete", key=f"menu_del_{sid}", use_container_width=True):
                         delete_chat_session(sid)
                         if st.session_state.share_link_for_session and st.session_state.share_link_for_session[0] == sid:
                             st.session_state.share_link_for_session = None
@@ -1873,7 +1909,7 @@ with st.sidebar:
         st.session_state.mute_current_audio = False
 
     st.divider()
-    if st.button("🚪 Sign Out / Switch Staff", width="stretch"):
+    if st.button("🚪 Sign Out / Switch Staff", use_container_width=True):
         st.session_state["auth_user"] = None
         st.session_state.pop("active_session_id", None)
         st.session_state.pop("messages", None)
@@ -1901,7 +1937,7 @@ with st.expander(f"📊 Live {active_dept} Queue, Referrals & SQLite Audit Log",
 
     with tab_appts:
         if dept_snapshot["appointments"]:
-            st.dataframe(dept_snapshot["appointments"], width="stretch", hide_index=True)
+            st.dataframe(dept_snapshot["appointments"], use_container_width=True, hide_index=True)
             csv_bytes = _rows_to_csv_bytes(dept_snapshot["appointments"])
             safe_dept_slug = re.sub(r"[^A-Za-z0-9]+", "_", active_dept).strip("_")
             st.download_button(
@@ -1916,13 +1952,13 @@ with st.expander(f"📊 Live {active_dept} Queue, Referrals & SQLite Audit Log",
 
     with tab_refs:
         if dept_snapshot["referrals"]:
-            st.dataframe(dept_snapshot["referrals"], width="stretch", hide_index=True)
+            st.dataframe(dept_snapshot["referrals"], use_container_width=True, hide_index=True)
         else:
             st.caption(f"No incoming or outgoing referrals for {active_dept} yet.")
 
     with tab_inc:
         if dept_snapshot["incidents"]:
-            st.dataframe(dept_snapshot["incidents"], width="stretch", hide_index=True)
+            st.dataframe(dept_snapshot["incidents"], use_container_width=True, hide_index=True)
         else:
             st.caption(f"No open operational or RCM incidents logged for {active_dept}.")
 
@@ -1934,9 +1970,9 @@ if st.session_state.live_mode_active:
             st.markdown("#### 🎙️ Live Spoken Conversation")
             st.caption("Speak directly to SisterAI—she answers back by voice in real time.")
         with hdr_r:
-            if st.button("🔇 Mute Voice", key="mute_live_btn", width="stretch"):
+            if st.button("🔇 Mute Voice", key="mute_live_btn", use_container_width=True):
                 st.session_state.mute_current_audio = True
-            elif st.session_state.mute_current_audio and st.button("🔊 Unmute", key="unmute_live_btn", width="stretch"):
+            elif st.session_state.mute_current_audio and st.button("🔊 Unmute", key="unmute_live_btn", use_container_width=True):
                 st.session_state.mute_current_audio = False
 
         live_audio = st.audio_input(
