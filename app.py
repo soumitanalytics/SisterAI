@@ -22,9 +22,9 @@ from gtts import gTTS
 import requests
 import streamlit as st
 
-# 1. Load Environment Variables
+# 1. Load Environment Variables (Supports both local .env and Streamlit Cloud st.secrets)
 load_dotenv()
-API_KEY = os.getenv("GEMINI_API_KEY")
+API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
 
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -932,9 +932,7 @@ def create_department_referral(
     clinical_notes: str = "",
     priority: str = "Routine",
 ) -> str:
-    """Creates a controlled cross-department referral handoff from the active department to another hospital department
-    without exposing private records or granting direct edit access to the receiving department.
-    """
+    """Creates a controlled cross-department referral handoff from the active department to another hospital department."""
     from_dept = get_active_department()
     user = get_active_user()
     matched_target = _match_department_name(to_department)
@@ -1032,9 +1030,7 @@ def send_email_notification(
     body: str,
     attach_latest_bill: bool = False,
 ) -> str:
-    """Sends an email to ANY recipient address via SMTP if open on network, or via HTTPS MAIL_RELAY_URL
-    if SMTP ports are blocked, and always provides a ready-to-use mailto: fallback link.
-    """
+    """Sends an email to ANY recipient address via SMTP, HTTPS relay, or mailto fallback."""
     target = (to_email or "").strip()
     if not target or "@" not in target:
         return "EMAIL_FAILED: Please provide a valid recipient email address."
@@ -1070,7 +1066,7 @@ def send_email_notification(
         except Exception as smtp_err:
             smtp_reason = str(smtp_err)
     else:
-        smtp_reason = "SMTP credentials not set in .env"
+        smtp_reason = "SMTP credentials not set"
 
     if MAIL_RELAY_URL:
         try:
@@ -1091,7 +1087,7 @@ def send_email_notification(
         except Exception as rel_err:
             relay_reason = f"Relay error: {str(rel_err)}"
     else:
-        relay_reason = "MAIL_RELAY_URL not set in .env"
+        relay_reason = "MAIL_RELAY_URL not set"
 
     return (
         f"EMAIL_NETWORK_BLOCKED_FALLBACK: Direct send to {target} did not complete ({smtp_reason}; {relay_reason}). "
@@ -1562,30 +1558,37 @@ def build_multi_turn_contents(history_messages: list[dict], new_contents: list) 
         item if isinstance(item, types.Part) else types.Part.from_text(text=str(item))
         for item in new_contents
     ]
-    contents.append(types.Content(role=role if False else "user", parts=current_parts))
+    contents.append(types.Content(role="user", parts=current_parts))
     return contents
 
+MODEL_FALLBACK_CHAIN = [
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+
 def generate_with_retry(contents: list, instruction: str, temperature: float):
-    """Retries transient 503/UNAVAILABLE spikes automatically before surfacing an error."""
+    """Tries primary Gemini model and fails over automatically on 503/429 demand spikes."""
     last_err = None
-    for attempt in range(3):
-        try:
-            return client.models.generate_content(
-                model="gemini-3.5-flash-lite",
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=instruction,
-                    tools=SISTER_TOOLS,
-                    temperature=temperature,
-                ),
-            )
-        except Exception as e:
-            last_err = e
-            err_str = str(e)
-            if ("503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str) and attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            raise
+    for model_name in MODEL_FALLBACK_CHAIN:
+        for attempt in range(2):
+            try:
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=instruction,
+                        tools=SISTER_TOOLS,
+                        temperature=temperature,
+                    ),
+                )
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "404" in err_str:
+                    time.sleep(0.8)
+                    continue
+                raise
     raise last_err
 
 def run_sister_turn(
@@ -1621,7 +1624,10 @@ def run_sister_turn(
                 voice_stream = None
                 raw_audio_bytes = None
                 if should_speak and reply_text:
-                    voice_stream, raw_audio_bytes = generate_voice_response(reply_text)
+                    try:
+                        voice_stream, raw_audio_bytes = generate_voice_response(reply_text)
+                    except Exception:
+                        voice_stream, raw_audio_bytes = None, None
 
                 bill_info = st.session_state.get("pending_bill_pdf")
                 bill_bytes = bill_info["bytes"] if bill_info else None
@@ -1852,7 +1858,7 @@ with st.sidebar:
     if st.session_state.share_link_for_session:
         _, shared_title, share_token = st.session_state.share_link_for_session
         st.caption(f"Share link for **{shared_title}**:")
-        st.code(f"http://localhost:8501/?share={share_token}", language="text")
+        st.code(f"https://sisterai.streamlit.app/?share={share_token}", language="text")
 
     st.divider()
     st.selectbox(
@@ -1860,7 +1866,7 @@ with st.sidebar:
         options=PAYMENT_MODES,
         key="selected_payment_mode",
     )
-    enable_voice_out = st.toggle("🔊 Enable Voice Replies", value=True)
+    enable_voice_out = st.toggle("🔊 Enable Voice Replies", value=False)
     live_toggle = st.toggle("🎙️ Live Conversation Mode", value=st.session_state.live_mode_active)
     if live_toggle != st.session_state.live_mode_active:
         st.session_state.live_mode_active = live_toggle
