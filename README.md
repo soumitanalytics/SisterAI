@@ -10,8 +10,7 @@ Multi-department healthcare operations, patient registration & auto-UHID intake,
 
 ## Local Setup
 ```bash
-git clone [https://github.com/soumitanalytics/SisterAI.git](https://github.com/soumitanalytics/SisterAI.git)
-cd SisterAI
+git clone https://github.com/soumitanalytics/SisterAI.git
 pip install -r requirements.txt
 ```
 Copy `.env.example` to `.env`, add your `GEMINI_API_KEY`, and run:
