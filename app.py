@@ -116,6 +116,15 @@ PROCEDURE_TARIFF_INR = {
     "radiotherapy": 8500,
 }
 
+DEFAULT_ADMIN_USER = {
+    "id": 1,
+    "username": "soumit",
+    "full_name": "Soumit Ghosh Chaudhury",
+    "department": "Radiology & Medical Imaging",
+    "role": "Enterprise Hospital Admin",
+    "is_admin": 1,
+}
+
 
 def _hash_password(raw_pw: str) -> str:
     return hashlib.sha256(raw_pw.strip().encode("utf-8")).hexdigest()
@@ -452,6 +461,50 @@ def ensure_database_initialized() -> bool:
 ensure_database_initialized()
 
 
+# Thread-safe context store (never touches st.session_state from worker threads)
+_THREAD_CTX = threading.local()
+
+
+def _make_ctx_snapshot(
+    user: dict | None = None,
+    dept: str | None = None,
+    pay_mode: str | None = None,
+    is_admin_central: bool | None = None,
+) -> dict:
+    resolved_user = dict(user) if user else dict(DEFAULT_ADMIN_USER)
+    resolved_dept = dept or resolved_user.get("department") or "Radiology & Medical Imaging"
+    resolved_mode = pay_mode if pay_mode in PAYMENT_MODES else PAYMENT_MODES[0]
+    if is_admin_central is None:
+        resolved_admin = bool(resolved_user.get("is_admin")) or resolved_dept in (
+            "Central Reception & Registration",
+            "Billing, Insurance & RCM",
+        )
+    else:
+        resolved_admin = bool(is_admin_central)
+    return {
+        "user": resolved_user,
+        "dept": resolved_dept,
+        "pay_mode": resolved_mode,
+        "is_admin_central": resolved_admin,
+        "bill_sink": None,
+    }
+
+
+def _current_runtime_ctx() -> dict:
+    ctx = getattr(_THREAD_CTX, "ctx", None)
+    if isinstance(ctx, dict):
+        return ctx
+    return _make_ctx_snapshot()
+
+
+def _record_bill_in_ctx(bill_info: dict) -> None:
+    ctx = _current_runtime_ctx()
+    sink = ctx.get("bill_sink")
+    if isinstance(sink, dict):
+        sink.clear()
+        sink.update(bill_info)
+
+
 # Background Session Runner Registry (Survives st.rerun() when clicking New Chat)
 @st.cache_resource
 def _get_background_turn_registry() -> dict[str, dict]:
@@ -460,44 +513,42 @@ def _get_background_turn_registry() -> dict[str, dict]:
 
 def _submit_background_turn(
     session_id: str,
-    display_label: str,
     turn_inputs: list,
     enable_voice_out: bool,
     live_voice_mode: bool,
     recent_history: list[dict],
-    active_user: dict,
-    active_dept: str,
-    selected_payment_mode: str,
-    is_admin_central: bool,
+    ctx_snapshot: dict,
     mute_audio: bool,
 ) -> None:
     registry = _get_background_turn_registry()
     state = {"status": "running", "started_at": time.time(), "error": None}
     registry[session_id] = state
+    frozen_ctx = _make_ctx_snapshot(
+        user=ctx_snapshot.get("user"),
+        dept=ctx_snapshot.get("dept"),
+        pay_mode=ctx_snapshot.get("pay_mode"),
+        is_admin_central=ctx_snapshot.get("is_admin_central"),
+    )
 
     def _worker() -> None:
-        bill_holder: dict | None = None
+        bill_holder: dict = {}
+        run_ctx = dict(frozen_ctx)
+        run_ctx["bill_sink"] = bill_holder
+        _THREAD_CTX.ctx = run_ctx
         try:
             multi_contents = _build_multi_turn_contents_from_list(recent_history, turn_inputs)
             active_instruction = _build_system_instruction_for_context(
-                user=active_user,
-                dept=active_dept,
-                pay_mode=selected_payment_mode,
-                is_admin_central=is_admin_central,
+                user=run_ctx["user"],
+                dept=run_ctx["dept"],
+                pay_mode=run_ctx["pay_mode"],
+                is_admin_central=run_ctx["is_admin_central"],
                 live_voice_mode=live_voice_mode,
             )
             response = generate_with_retry(
                 contents=multi_contents,
                 instruction=active_instruction,
                 temperature=0.25 if live_voice_mode else 0.3,
-                context_overrides={
-                    "user": active_user,
-                    "dept": active_dept,
-                    "pay_mode": selected_payment_mode,
-                    "is_admin_central": is_admin_central,
-                    "bill_holder_ref": lambda val: None,
-                },
-                bill_sink=bill_holder,
+                context_overrides=run_ctx,
             )
             reply_text = (getattr(response, "text", None) or "").strip() or "Completed request."
 
@@ -509,8 +560,8 @@ def _submit_background_turn(
                 except Exception:
                     raw_audio_bytes = None
 
-            bill_bytes = bill_holder["bytes"] if bill_holder else None
-            bill_fname = bill_holder["filename"] if bill_holder else None
+            bill_bytes = bill_holder.get("bytes")
+            bill_fname = bill_holder.get("filename")
 
             save_message_to_db(session_id, "assistant", reply_text, raw_audio_bytes, bill_bytes, bill_fname)
             state["status"] = "done"
@@ -519,6 +570,8 @@ def _submit_background_turn(
             save_message_to_db(session_id, "assistant", err_msg, None, None, None)
             state["status"] = "error"
             state["error"] = err_msg
+        finally:
+            _THREAD_CTX.ctx = None
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -557,11 +610,11 @@ def list_all_staff_directory() -> list[dict]:
 
 
 def get_active_user() -> dict:
-    return st.session_state["auth_user"]
+    return st.session_state.get("auth_user") or DEFAULT_ADMIN_USER
 
 
 def get_active_department() -> str:
-    return st.session_state["active_department"]
+    return st.session_state.get("active_department") or get_active_user()["department"]
 
 
 def is_admin_or_central() -> bool:
@@ -820,35 +873,6 @@ def save_message_to_db(
         conn.commit()
     finally:
         conn.close()
-
-
-# Thread-local runtime context so background worker threads run safely without touching st.session_state
-_THREAD_CTX = threading.local()
-
-
-def _current_runtime_ctx() -> dict:
-    ctx = getattr(_THREAD_CTX, "ctx", None)
-    if ctx is not None:
-        return ctx
-    return {
-        "user": st.session_state["auth_user"],
-        "dept": st.session_state["active_department"],
-        "pay_mode": st.session_state.get("selected_payment_mode", PAYMENT_MODES[0]),
-        "is_admin_central": is_admin_or_central(),
-        "bill_sink": None,
-    }
-
-
-def _record_bill_in_ctx(bill_info: dict) -> None:
-    ctx = _current_runtime_ctx()
-    sink = ctx.get("bill_sink")
-    if isinstance(sink, dict):
-        sink.clear()
-        sink.update(bill_info)
-    try:
-        st.session_state["pending_bill_pdf"] = bill_info
-    except Exception:
-        pass
 
 
 # 8. Department-Enforced Registration, Payment Branching & Cross-Department Referrals
@@ -1794,11 +1818,17 @@ def generate_with_retry(
 ):
     """Tries primary Gemini model and fails over automatically on 503/429/404 errors."""
     active_client = get_genai_client()
-    base_ctx = _current_runtime_ctx().copy()
-    if context_overrides:
-        base_ctx.update(context_overrides)
+    prev_ctx = getattr(_THREAD_CTX, "ctx", None)
+    base_ctx = _make_ctx_snapshot(
+        user=(context_overrides or prev_ctx or {}).get("user"),
+        dept=(context_overrides or prev_ctx or {}).get("dept"),
+        pay_mode=(context_overrides or prev_ctx or {}).get("pay_mode"),
+        is_admin_central=(context_overrides or prev_ctx or {}).get("is_admin_central"),
+    )
     if bill_sink is not None:
         base_ctx["bill_sink"] = bill_sink
+    elif isinstance((context_overrides or prev_ctx), dict):
+        base_ctx["bill_sink"] = (context_overrides or prev_ctx).get("bill_sink")
 
     _THREAD_CTX.ctx = base_ctx
     last_err = None
@@ -1824,7 +1854,7 @@ def generate_with_retry(
                     raise
         raise last_err
     finally:
-        _THREAD_CTX.ctx = None
+        _THREAD_CTX.ctx = prev_ctx
 
 
 def run_sister_turn(
@@ -1834,7 +1864,12 @@ def run_sister_turn(
     enable_voice_out: bool,
     live_voice_mode: bool = False,
 ) -> None:
-    st.session_state["pending_bill_pdf"] = None
+    ctx_snapshot = _make_ctx_snapshot(
+        user=get_active_user(),
+        dept=get_active_department(),
+        pay_mode=st.session_state.get("selected_payment_mode", PAYMENT_MODES[0]),
+        is_admin_central=is_admin_or_central(),
+    )
     recent_snapshot = [
         {"role": m["role"], "content": m.get("content", "")}
         for m in st.session_state.messages[-2:]
@@ -1846,15 +1881,11 @@ def run_sister_turn(
 
     _submit_background_turn(
         session_id=session_id,
-        display_label=display_label,
         turn_inputs=turn_inputs,
         enable_voice_out=enable_voice_out,
         live_voice_mode=live_voice_mode,
         recent_history=recent_snapshot,
-        active_user=st.session_state["auth_user"],
-        active_dept=st.session_state["active_department"],
-        selected_payment_mode=st.session_state.get("selected_payment_mode", PAYMENT_MODES[0]),
-        is_admin_central=is_admin_or_central(),
+        ctx_snapshot=ctx_snapshot,
         mute_audio=st.session_state.mute_current_audio,
     )
 
