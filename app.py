@@ -160,7 +160,6 @@ def _pdf_escape(text: str) -> str:
 
 
 def create_pdf_bill_file(bill_record: dict) -> tuple[str, bytes]:
-    """Generates a valid PDF invoice/bill on disk and returns (file_path, pdf_bytes)."""
     lines = [
         "SISTERAI HOSPITAL - CLINICAL & DIAGNOSTIC BILL / RECEIPT",
         "-----------------------------------------------------------------------",
@@ -247,7 +246,7 @@ def create_pdf_bill_file(bill_record: dict) -> tuple[str, bytes]:
     return file_path, pdf_bytes
 
 
-# 5. SQLite Database (Staff RBAC, Appointments, Referrals, Ops Incidents, Chat Sessions)
+# 5. SQLite Database
 def get_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=20.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -257,7 +256,6 @@ def get_db_connection() -> sqlite3.Connection:
 
 
 def _init_database_impl() -> bool:
-    """Initializes and migrates all SQLite tables and seeds staff directory."""
     conn = get_db_connection()
     try:
         conn.execute(
@@ -329,25 +327,6 @@ def _init_database_impl() -> bool:
             )
             """
         )
-        existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(appointments)").fetchall()}
-        migrations = {
-            "unique_id": "TEXT DEFAULT 'UHID-LEGACY'",
-            "age": "INTEGER DEFAULT 30",
-            "prescription": "TEXT DEFAULT 'On File / Dept Intake'",
-            "referring_doctor": "TEXT DEFAULT 'Departmental Referral'",
-            "patient_type": "TEXT DEFAULT 'Outpatient'",
-            "address": "TEXT DEFAULT 'Not Provided'",
-            "email": "TEXT DEFAULT 'Not Provided'",
-            "scan_procedure": "TEXT DEFAULT 'Diagnostic Evaluation'",
-            "payment_mode": "TEXT DEFAULT 'Online Payment (UPI)'",
-            "payment_status": "TEXT DEFAULT 'PAID'",
-            "payment_link": "TEXT DEFAULT ''",
-            "bill_path": "TEXT DEFAULT ''",
-            "created_by": "TEXT DEFAULT 'System'",
-        }
-        for col_name, col_def in migrations.items():
-            if col_name not in existing_cols:
-                conn.execute(f"ALTER TABLE appointments ADD COLUMN {col_name} {col_def}")
 
         conn.execute(
             """
@@ -382,9 +361,6 @@ def _init_database_impl() -> bool:
             )
             """
         )
-        inc_cols = {r["name"] for r in conn.execute("PRAGMA table_info(ops_incidents)").fetchall()}
-        if "reported_by" not in inc_cols:
-            conn.execute("ALTER TABLE ops_incidents ADD COLUMN reported_by TEXT DEFAULT 'System'")
 
         conn.execute(
             """
@@ -399,13 +375,6 @@ def _init_database_impl() -> bool:
             )
             """
         )
-        sess_cols = {r["name"] for r in conn.execute("PRAGMA table_info(chat_sessions)").fetchall()}
-        if "pinned" not in sess_cols:
-            conn.execute("ALTER TABLE chat_sessions ADD COLUMN pinned INTEGER DEFAULT 0")
-        if "owner_username" not in sess_cols:
-            conn.execute("ALTER TABLE chat_sessions ADD COLUMN owner_username TEXT DEFAULT 'soumit'")
-        if "department" not in sess_cols:
-            conn.execute("ALTER TABLE chat_sessions ADD COLUMN department TEXT DEFAULT 'Radiology & Medical Imaging'")
 
         conn.execute(
             """
@@ -422,11 +391,6 @@ def _init_database_impl() -> bool:
             )
             """
         )
-        msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(chat_messages)").fetchall()}
-        if "bill_pdf_bytes" not in msg_cols:
-            conn.execute("ALTER TABLE chat_messages ADD COLUMN bill_pdf_bytes BLOB")
-        if "bill_filename" not in msg_cols:
-            conn.execute("ALTER TABLE chat_messages ADD COLUMN bill_filename TEXT")
 
         appt_count = conn.execute("SELECT COUNT(*) AS cnt FROM appointments").fetchone()["cnt"]
         if appt_count == 0:
@@ -460,8 +424,6 @@ def ensure_database_initialized() -> bool:
 
 ensure_database_initialized()
 
-
-# Thread-safe context store (never touches st.session_state from worker threads)
 _THREAD_CTX = threading.local()
 
 
@@ -503,77 +465,6 @@ def _record_bill_in_ctx(bill_info: dict) -> None:
     if isinstance(sink, dict):
         sink.clear()
         sink.update(bill_info)
-
-
-# Background Session Runner Registry (Survives st.rerun() when clicking New Chat)
-@st.cache_resource
-def _get_background_turn_registry() -> dict[str, dict]:
-    return {}
-
-
-def _submit_background_turn(
-    session_id: str,
-    turn_inputs: list,
-    enable_voice_out: bool,
-    live_voice_mode: bool,
-    recent_history: list[dict],
-    ctx_snapshot: dict,
-    mute_audio: bool,
-) -> None:
-    registry = _get_background_turn_registry()
-    state = {"status": "running", "started_at": time.time(), "error": None}
-    registry[session_id] = state
-    frozen_ctx = _make_ctx_snapshot(
-        user=ctx_snapshot.get("user"),
-        dept=ctx_snapshot.get("dept"),
-        pay_mode=ctx_snapshot.get("pay_mode"),
-        is_admin_central=ctx_snapshot.get("is_admin_central"),
-    )
-
-    def _worker() -> None:
-        bill_holder: dict = {}
-        run_ctx = dict(frozen_ctx)
-        run_ctx["bill_sink"] = bill_holder
-        _THREAD_CTX.ctx = run_ctx
-        try:
-            multi_contents = _build_multi_turn_contents_from_list(recent_history, turn_inputs)
-            active_instruction = _build_system_instruction_for_context(
-                user=run_ctx["user"],
-                dept=run_ctx["dept"],
-                pay_mode=run_ctx["pay_mode"],
-                is_admin_central=run_ctx["is_admin_central"],
-                live_voice_mode=live_voice_mode,
-            )
-            response = generate_with_retry(
-                contents=multi_contents,
-                instruction=active_instruction,
-                temperature=0.25 if live_voice_mode else 0.3,
-                context_overrides=run_ctx,
-            )
-            reply_text = (getattr(response, "text", None) or "").strip() or "Completed request."
-
-            should_speak = (enable_voice_out or live_voice_mode) and not mute_audio
-            raw_audio_bytes = None
-            if should_speak and reply_text:
-                try:
-                    _, raw_audio_bytes = generate_voice_response(reply_text)
-                except Exception:
-                    raw_audio_bytes = None
-
-            bill_bytes = bill_holder.get("bytes")
-            bill_fname = bill_holder.get("filename")
-
-            save_message_to_db(session_id, "assistant", reply_text, raw_audio_bytes, bill_bytes, bill_fname)
-            state["status"] = "done"
-        except Exception as e:
-            err_msg = f"System Error: {str(e)}"
-            save_message_to_db(session_id, "assistant", err_msg, None, None, None)
-            state["status"] = "error"
-            state["error"] = err_msg
-        finally:
-            _THREAD_CTX.ctx = None
-
-    threading.Thread(target=_worker, daemon=True).start()
 
 
 # 6. Authentication & Department Context Helpers
@@ -626,7 +517,6 @@ def is_admin_or_central() -> bool:
 
 
 def fetch_department_dashboard_snapshot(department: str) -> dict:
-    """Fetches scoped KPIs and live SQLite rows for the active department only."""
     conn = get_db_connection()
     try:
         appts = conn.execute(
@@ -927,9 +817,6 @@ def register_and_schedule_patient(
     status: str = "Scheduled",
     payment_mode: str = "",
 ) -> str:
-    """Department-scoped patient registration & scheduling with self-check, auto-UHID,
-    payment mode branching (Online/Card link vs Cash direct bill), under-13 UNPAID exception, and PDF bill.
-    """
     target_dept, access_err = _resolve_target_department(department)
     if access_err:
         return access_err
@@ -1124,7 +1011,6 @@ def create_department_referral(
     clinical_notes: str = "",
     priority: str = "Routine",
 ) -> str:
-    """Creates a controlled cross-department referral handoff from the active department to another hospital department."""
     ctx = _current_runtime_ctx()
     from_dept = ctx["dept"]
     user = ctx["user"]
@@ -1179,7 +1065,6 @@ def create_department_referral(
 
 
 def list_department_referrals(direction: str = "all") -> str:
-    """Lists incoming and outgoing cross-department referrals for the active department."""
     active_dept = _current_runtime_ctx()["dept"]
     conn = get_db_connection()
     try:
@@ -1225,7 +1110,6 @@ def send_email_notification(
     body: str,
     attach_latest_bill: bool = False,
 ) -> str:
-    """Sends an email to ANY recipient address via SMTP, HTTPS relay, or mailto fallback."""
     target = (to_email or "").strip()
     if not target or "@" not in target:
         return "EMAIL_FAILED: Please provide a valid recipient email address."
@@ -1297,7 +1181,6 @@ def check_availability(
     department: str = "",
     provider_or_resource: str = "",
 ) -> str:
-    """Checks booked appointments on a YYYY-MM-DD date within the authorized department scope."""
     target_dept, access_err = _resolve_target_department(department)
     if access_err:
         return access_err
@@ -1337,7 +1220,6 @@ def reschedule_or_update_appointment(
     status: str = "",
     payment_status: str = "",
 ) -> str:
-    """Reschedules or updates an appointment ID (enforces department access control)."""
     ctx = _current_runtime_ctx()
     active_dept = ctx["dept"]
     conn = get_db_connection()
@@ -1389,7 +1271,6 @@ def reschedule_or_update_appointment(
 
 
 def list_upcoming_appointments(patient_or_date: str = "") -> str:
-    """Lists appointments filtered by patient name, UHID, or YYYY-MM-DD date within authorized department scope."""
     active_dept = _current_runtime_ctx()["dept"]
     conn = get_db_connection()
     try:
@@ -1438,7 +1319,6 @@ def log_ops_or_rcm_incident(
     severity: str = "Medium",
     estimated_impact: str = "Unspecified",
 ) -> str:
-    """Logs a department downtime, bottleneck, or claim denial/RCM issue in SQLite behind the scenes."""
     ctx = _current_runtime_ctx()
     active_dept = ctx["dept"]
     user = ctx["user"]
@@ -1469,7 +1349,6 @@ def log_ops_or_rcm_incident(
 
 
 def get_imaging_protocol_checklist(modality: str, contrast_or_implant: str = "") -> str:
-    """Returns structured clinical/imaging safety, preparation, and throughput checks."""
     mod = (modality or "").strip().lower()
     extra = (contrast_or_implant or "").strip()
     base = [
@@ -1503,9 +1382,8 @@ def get_imaging_protocol_checklist(modality: str, contrast_or_implant: str = "")
     return "\n".join(base)
 
 
-# 11. Pharmaceutical Knowledge Tool (OpenFDA Live API - 100% Free)
+# 11. Pharmaceutical Knowledge Tool (OpenFDA Live API)
 def lookup_pharmaceutical_data(drug_name: str) -> str:
-    """Queries live OpenFDA drug label data for indications, contraindications, and warnings."""
     clean_drug = (drug_name or "").strip()
     if not clean_drug:
         return "Please provide a medication or contrast agent name."
@@ -1536,7 +1414,7 @@ def lookup_pharmaceutical_data(drug_name: str) -> str:
         return f"OpenFDA lookup unavailable ({str(e)}). Provide general pharmacology guidance."
 
 
-# 12. Focused Healthcare News, Medical Journals & Research Papers Tool (Parallelized)
+# 12. Healthcare News, Medical Journals & Research Papers Tool
 def _fetch_pubmed_papers(clean_topic: str) -> str | None:
     try:
         esearch_url = (
@@ -1612,7 +1490,6 @@ def _fetch_healthcare_news(clean_topic: str, scope: str) -> str | None:
 
 
 def search_healthcare_literature_and_news(topic: str, scope: str = "both") -> str:
-    """Searches healthcare news, medical journals, and papers across national (India) and international health sources."""
     clean_topic = (topic or "").strip()
     if not clean_topic:
         return "Provide a healthcare or medical research topic."
@@ -1643,7 +1520,7 @@ def search_healthcare_literature_and_news(topic: str, scope: str = "both") -> st
     return "\n\n".join(chunks) if chunks else f"No recent medical journal/news items found for '{clean_topic}'."
 
 
-# 13. Full-Length Text-to-Speech Helper
+# 13. Text-to-Speech Helper
 def _clean_for_speech(text: str) -> str:
     no_urls = re.sub(r"https?://\S+", "", text or "")
     no_md = re.sub(r"[*_#`~>\[\]\(\)]", " ", no_urls)
@@ -1670,7 +1547,6 @@ def _split_speech_chunks(text: str, max_chars: int = 900) -> list[str]:
 
 
 def generate_voice_response(text: str) -> tuple[io.BytesIO | None, bytes | None]:
-    """Converts the entire cleaned response to MP3 audio bytes without cutting off."""
     spoken_text = _clean_for_speech(text)
     if not spoken_text:
         return None, None
@@ -1714,7 +1590,7 @@ def build_file_parts(uploaded_files) -> list:
     return parts
 
 
-# 15. Dynamic Department-Aware System Instructions & Tools
+# 15. System Instructions, Model Execution & Turn Runner
 def _build_system_instruction_for_context(
     user: dict,
     dept: str,
@@ -1756,17 +1632,6 @@ Rules:
 """
 
 
-def build_system_instruction(live_voice_mode: bool = False) -> str:
-    ctx = _current_runtime_ctx()
-    return _build_system_instruction_for_context(
-        user=ctx["user"],
-        dept=ctx["dept"],
-        pay_mode=ctx["pay_mode"],
-        is_admin_central=ctx["is_admin_central"],
-        live_voice_mode=live_voice_mode,
-    )
-
-
 SISTER_TOOLS = [
     register_and_schedule_patient,
     create_department_referral,
@@ -1799,10 +1664,6 @@ def _build_multi_turn_contents_from_list(history_messages: list[dict], new_conte
     return contents
 
 
-def build_multi_turn_contents(history_messages: list[dict], new_contents: list) -> list:
-    return _build_multi_turn_contents_from_list(history_messages, new_contents)
-
-
 MODEL_FALLBACK_CHAIN = [
     "gemini-3.5-flash-lite",
     "gemini-3.5-flash",
@@ -1816,7 +1677,6 @@ def generate_with_retry(
     context_overrides: dict | None = None,
     bill_sink: dict | None = None,
 ):
-    """Tries primary Gemini model and fails over automatically on 503/429/404 errors."""
     active_client = get_genai_client()
     prev_ctx = getattr(_THREAD_CTX, "ctx", None)
     base_ctx = _make_ctx_snapshot(
@@ -1879,49 +1739,74 @@ def run_sister_turn(
     )
     save_message_to_db(session_id, "user", display_label, None, None, None)
 
-    _submit_background_turn(
-        session_id=session_id,
-        turn_inputs=turn_inputs,
-        enable_voice_out=enable_voice_out,
-        live_voice_mode=live_voice_mode,
-        recent_history=recent_snapshot,
-        ctx_snapshot=ctx_snapshot,
-        mute_audio=st.session_state.mute_current_audio,
-    )
-
     with st.chat_message("user"):
         st.markdown(display_label)
 
     with st.chat_message("assistant"):
         spinner_msg = "SisterAI is speaking..." if live_voice_mode else "SisterAI is responding..."
-        placeholder = st.empty()
-        registry = _get_background_turn_registry()
-        with st.spinner(spinner_msg):
-            while registry.get(session_id, {}).get("status") == "running":
-                if st.session_state.get("active_session_id") != session_id:
-                    return
-                time.sleep(0.35)
+        bill_holder: dict = {}
+        run_ctx = dict(ctx_snapshot)
+        run_ctx["bill_sink"] = bill_holder
+        _THREAD_CTX.ctx = run_ctx
 
-        if st.session_state.get("active_session_id") != session_id:
-            return
+        try:
+            with st.spinner(spinner_msg):
+                multi_contents = _build_multi_turn_contents_from_list(recent_snapshot, turn_inputs)
+                active_instruction = _build_system_instruction_for_context(
+                    user=run_ctx["user"],
+                    dept=run_ctx["dept"],
+                    pay_mode=run_ctx["pay_mode"],
+                    is_admin_central=run_ctx["is_admin_central"],
+                    live_voice_mode=live_voice_mode,
+                )
+                response = generate_with_retry(
+                    contents=multi_contents,
+                    instruction=active_instruction,
+                    temperature=0.25 if live_voice_mode else 0.3,
+                    context_overrides=run_ctx,
+                )
+                reply_text = (getattr(response, "text", None) or "").strip() or "Completed request."
 
-        refreshed = load_session_messages(session_id)
-        st.session_state.messages = refreshed
-        if refreshed and refreshed[-1]["role"] == "assistant":
-            last_msg = refreshed[-1]
-            with placeholder.container():
-                st.markdown(last_msg["content"])
-                if last_msg.get("audio") is not None:
-                    last_msg["audio"].seek(0)
-                    st.audio(last_msg["audio"], format="audio/mp3", autoplay=True)
-                if last_msg.get("bill_pdf_bytes") and last_msg.get("bill_filename"):
-                    st.download_button(
-                        label=f"🖨️ Download Printable PDF Bill ({last_msg['bill_filename']})",
-                        data=last_msg["bill_pdf_bytes"],
-                        file_name=last_msg["bill_filename"],
-                        mime="application/pdf",
-                        key=f"dl_bill_{session_id}_{len(refreshed)}_{last_msg['bill_filename']}",
-                    )
+                should_speak = (enable_voice_out or live_voice_mode) and not st.session_state.mute_current_audio
+                raw_audio_bytes = None
+                audio_stream = None
+                if should_speak and reply_text:
+                    try:
+                        audio_stream, raw_audio_bytes = generate_voice_response(reply_text)
+                    except Exception:
+                        audio_stream, raw_audio_bytes = None, None
+
+                bill_bytes = bill_holder.get("bytes")
+                bill_fname = bill_holder.get("filename")
+                save_message_to_db(session_id, "assistant", reply_text, raw_audio_bytes, bill_bytes, bill_fname)
+        except Exception as e:
+            reply_text = f"System Error: {str(e)}"
+            audio_stream, bill_bytes, bill_fname = None, None, None
+            save_message_to_db(session_id, "assistant", reply_text, None, None, None)
+        finally:
+            _THREAD_CTX.ctx = None
+
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": reply_text,
+                "audio": audio_stream,
+                "bill_pdf_bytes": bill_bytes,
+                "bill_filename": bill_fname,
+            }
+        )
+        st.markdown(reply_text)
+        if audio_stream is not None:
+            audio_stream.seek(0)
+            st.audio(audio_stream, format="audio/mp3", autoplay=True)
+        if bill_bytes and bill_fname:
+            st.download_button(
+                label=f"🖨️ Download Printable PDF Bill ({bill_fname})",
+                data=bill_bytes,
+                file_name=bill_fname,
+                mime="application/pdf",
+                key=f"dl_bill_{session_id}_{len(st.session_state.messages)}_{bill_fname}",
+            )
 
 
 def _rows_to_csv_bytes(rows: list[dict]) -> bytes:
@@ -1990,7 +1875,7 @@ if st.session_state["auth_user"] is None:
         )
     st.stop()
 
-# 17. Authenticated Session Initialization (Scoped to Staff User & Active Department)
+# 17. Authenticated Session Initialization
 current_user = get_active_user()
 active_dept = get_active_department()
 query_params = st.query_params
@@ -2038,7 +1923,7 @@ if "mute_current_audio" not in st.session_state:
 if "selected_payment_mode" not in st.session_state:
     st.session_state.selected_payment_mode = PAYMENT_MODES[0]
 
-# 18. Sidebar: Staff/Department Badge, Chat History (⋮ Menu), Payment Mode, Voice & Logout
+# 18. Sidebar
 with st.sidebar:
     st.markdown(f"**👤 {current_user['full_name']}**")
     st.caption(f"{current_user['role']}")
@@ -2076,18 +1961,16 @@ with st.sidebar:
 
     st.markdown("### Chat History")
     sessions = list_chat_sessions(current_user["username"], active_dept)
-    bg_reg = _get_background_turn_registry()
     for s in sessions:
         sid = s["id"]
         is_current = sid == st.session_state.active_session_id
         is_pinned = bool(s["pinned"])
-        running_badge = "⏳ " if bg_reg.get(sid, {}).get("status") == "running" else ""
 
         col_title, col_menu = st.columns([0.82, 0.18])
         with col_title:
             pin_prefix = "📌 " if is_pinned else ""
             active_prefix = "▸ " if is_current else ""
-            if st.button(f"{active_prefix}{running_badge}{pin_prefix}{s['title']}", key=f"open_{sid}", use_container_width=True):
+            if st.button(f"{active_prefix}{pin_prefix}{s['title']}", key=f"open_{sid}", use_container_width=True):
                 st.session_state.active_session_id = sid
                 st.session_state.messages = load_session_messages(sid)
                 st.session_state.live_turn_counter += 1
